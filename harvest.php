@@ -16,7 +16,12 @@ require_once (dirname(__FILE__) . '/sqlite.php');
 define('BATCH_SIZE',  10);        // max terms per request (also bounded by MAX_QUERY_CHARS)
 define('MAX_QUERY_CHARS', 240);   // BOLD caps the query string at 250 chars; stay under it.
                                   // processid triplets are longer, so they batch smaller.
-define('MAX_IMAGES',  1000000);   // effectively "all" (defeats the IMG_LIMIT=50 cap)
+define('MAX_IMAGES',  1000000);   // as large as useful; /api/images hard-caps the
+                                  // response at 500 images per query regardless.
+define('REPAIR_THRESHOLD', 10);   // 'repair' mode re-fetches (one BIN per request, so
+                                  // no batch dilution) every BIN with at least this many
+                                  // stored images. Lower = catches more diluted BINs,
+                                  // but more requests.
 define('SLEEP_MIN_US', 1000000);  // polite delay between batches: 1s ..
 define('SLEEP_MAX_US', 3000000);  // .. 3s
 define('MAX_RETRIES',  4);        // per-batch retries on transport / HTTP errors
@@ -382,13 +387,18 @@ if (getenv('HARVEST_NO_RUN'))
 //   'bins'      - read BIN uris from all_bins.csv, skipping ones already searched
 //   'rerun'     - re-fetch every BIN already in the query table (fixes the old
 //                 max_images=-1 truncation and backfills bin_uri)
+//   'repair'    - re-fetch image-rich BINs ONE PER REQUEST so they aren't diluted by
+//                 the per-query process-id sampling that affects batched fetches.
+//                 Brings every <=500-image BIN to completeness (BOLD caps /api/images
+//                 at 500 images/query, so bigger BINs top out at 500).
 //   'processid' - read processids from processid.csv, skip orphans already captured
 //                 via a BIN or already searched, fetch the rest
 $mode = isset($argv[1]) ? $argv[1] : 'bins';
 
-$prefix = 'bin:uri:';   // triplet scope for the current mode
-$label  = 'BINs';
-$terms  = null;          // an iterable (generator/array) of terms to process
+$prefix      = 'bin:uri:';   // triplet scope for the current mode
+$label       = 'BINs';
+$terms       = null;         // an iterable (generator/array) of terms to process
+$batch_limit = BATCH_SIZE;   // terms per request (forced to 1 for 'repair')
 
 if ($mode == 'bins')
 {
@@ -407,6 +417,23 @@ elseif ($mode == 'rerun')
 	$terms = $bins;
 	echo "-- mode=rerun, re-fetching " . count($bins) . " previously-searched BINs\n";
 }
+elseif ($mode == 'repair')
+{
+	// BINs with enough stored images to be plausibly diluted by batching.
+	// Optional CLI override: `php harvest.php repair <threshold>`.
+	$threshold = isset($argv[2]) ? (int)$argv[2] : REPAIR_THRESHOLD;
+	$rows = db_get('SELECT bin_uri FROM boldcaosimage WHERE bin_uri IS NOT NULL'
+	             . ' GROUP BY bin_uri HAVING COUNT(*) >= ' . $threshold);
+	$bins = array();
+	foreach ($rows as $row)
+	{
+		$bins[] = $row->bin_uri;
+	}
+	$terms       = $bins;
+	$batch_limit = 1; // one BIN per request: no batch dilution
+	echo "-- mode=repair, re-fetching " . count($bins) . " BINs with >= " . $threshold
+	   . " stored images, one per request\n";
+}
 elseif ($mode == 'processid')
 {
 	$prefix = 'ids:processid:';
@@ -416,7 +443,7 @@ elseif ($mode == 'processid')
 }
 else
 {
-	echo "unknown mode '$mode' (use 'bins', 'rerun' or 'processid')\n";
+	echo "unknown mode '$mode' (use 'bins', 'rerun', 'repair' or 'processid')\n";
 	exit(1);
 }
 
@@ -473,7 +500,7 @@ foreach ($terms as $term)
 	$cost = strlen($prefix) + strlen($term) + 1; // +1 for the ';' separator
 
 	// Flush before this term would overflow either the count or the char budget.
-	if (count($batch) > 0 && (count($batch) >= BATCH_SIZE || $batch_chars + $cost > MAX_QUERY_CHARS))
+	if (count($batch) > 0 && (count($batch) >= $batch_limit || $batch_chars + $cost > MAX_QUERY_CHARS))
 	{
 		$flush();
 	}
@@ -501,12 +528,22 @@ the undocumented /openapi.json:
     Scopes: tax, geo, ids, bin, recordsetcode. The query string has a 250-char
     limit (=> ~11 BINs of the form bin:uri:BOLD:XXXXXXX); BATCH_SIZE stays under it.
 
-  - /api/images/{query_id}?max_images=N returns image metadata INCLUDING bin_uri.
-    WARNING: max_images < 0 means "use IMG_LIMIT" (=50) and the endpoint returns a
-    RANDOM sample of up to that many images from a random sample of process ids.
-    Pass a large max_images to get everything. Very image-rich BINs may still be
-    limited by the process-id sampling cap; small batches keep us well clear.
+  - /api/images/{query_id}?max_images=N returns image metadata INCLUDING bin_uri
+    and processid, so images can be attributed back to their term. Caps:
+      * max_images < 0 means "use IMG_LIMIT" (=50): the OLD bug, silently truncating.
+      * Even with a huge max_images, the response is HARD-CAPPED at 500 images/query.
+      * Results are a RANDOM sample from a random subset of process ids, so when many
+        BINs are batched the per-BIN share is "diluted" below its true count.
+    Two consequences we exploit:
+      * 'repair' mode re-fetches rich BINs ONE PER REQUEST -> no dilution, up to 500.
+      * Because each call samples randomly, re-running 'repair' ACCUMULATES distinct
+        images via the object_id upsert, climbing past 500 for very large BINs.
 
+  - processid.csv is a largely DIFFERENT population from the BINs (~0.7% overlap):
+    mostly BIN-less specimens. So the processid pass is its own job, not a way to
+    backfill images missing from rich BINs - 'repair' handles those.
+
+  - /api/counts?query=<triplets> returns {"records": N} (specimen records, not images).
   - /api/documents/{query_id}/download?format=tsv|json|dwc gives full BCDM specimen
     records (no image URLs) and ignores the extent. Useful for bulk record pulls.
 */
