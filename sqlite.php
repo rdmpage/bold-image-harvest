@@ -2,6 +2,10 @@
 
 $config['pdo'] = new PDO('sqlite:boldcaosimage.db');
 
+// Wait up to 30s for a lock rather than failing instantly, so multiple harvest
+// processes (e.g. a 'bins' and a 'processid' run) can share the database.
+$config['pdo']->exec('PRAGMA busy_timeout = 30000');
+
 //----------------------------------------------------------------------------------------
 // retrieve data from database
 function db_get($sql)
