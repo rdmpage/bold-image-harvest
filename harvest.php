@@ -11,6 +11,10 @@
 
 require_once (dirname(__FILE__) . '/sqlite.php');
 
+// The 'bins' done-set is an in-memory hash of every searched id (470k+); give PHP
+// room for it well beyond the stock 128M.
+ini_set('memory_limit', '1024M');
+
 //----------------------------------------------------------------------------------------
 // Tunables
 define('BATCH_SIZE',  10);        // max terms per request (also bounded by MAX_QUERY_CHARS)
@@ -233,13 +237,17 @@ function store_batch($bins, $images, $keys, $tablename)
 
 //----------------------------------------------------------------------------------------
 // Load the set of already-searched ids into memory once (PK lookups in a tight
-// 470k-iteration loop are slow; an in-memory hash is instant).
+// 470k-iteration loop are slow; an in-memory hash is instant). Read the id column
+// straight from the statement -- db_get() would build a stdClass per row, which
+// blows the memory limit once the query table has hundreds of thousands of rows.
 function load_done_set()
 {
+	global $config;
 	$done = array();
-	foreach (db_get('SELECT id FROM query') as $row)
+	$stmt = $config['pdo']->query('SELECT id FROM query');
+	while (($id = $stmt->fetchColumn(0)) !== false)
 	{
-		$done[$row->id] = true;
+		$done[$id] = true;
 	}
 	return $done;
 }
