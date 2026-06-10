@@ -429,6 +429,10 @@ elseif ($mode == 'repair')
 {
 	// BINs with enough stored images to be plausibly diluted by batching.
 	// Optional CLI override: `php harvest.php repair <threshold>`.
+	// Resumable: a 'repaired' table records BINs already re-fetched so a run
+	// interrupted by throttling picks up where it left off instead of restarting.
+	// (To re-accumulate images for huge BINs, DELETE FROM repaired and run again.)
+	$config['pdo']->exec('CREATE TABLE IF NOT EXISTS repaired (bin_uri TEXT PRIMARY KEY)');
 	$threshold = isset($argv[2]) ? (int)$argv[2] : REPAIR_THRESHOLD;
 	$rows = db_get('SELECT bin_uri FROM boldcaosimage WHERE bin_uri IS NOT NULL'
 	             . ' GROUP BY bin_uri HAVING COUNT(*) >= ' . $threshold);
@@ -437,10 +441,24 @@ elseif ($mode == 'repair')
 	{
 		$bins[] = $row->bin_uri;
 	}
+	$total_rich = count($bins);
+
+	// Skip BINs already repaired in a previous run.
+	$done_repair = array();
+	$stmt = $config['pdo']->query('SELECT bin_uri FROM repaired');
+	while (($b = $stmt->fetchColumn(0)) !== false)
+	{
+		$done_repair[$b] = true;
+	}
+	$bins = array_values(array_filter($bins, function($b) use ($done_repair) {
+		return !isset($done_repair[$b]);
+	}));
+
 	$terms       = $bins;
 	$batch_limit = 1; // one BIN per request: no batch dilution
-	echo "-- mode=repair, re-fetching " . count($bins) . " BINs with >= " . $threshold
-	   . " stored images, one per request\n";
+	echo "-- mode=repair, " . $total_rich . " BINs >= " . $threshold . " images; "
+	   . count($done_repair) . " already repaired, " . count($bins)
+	   . " to go (one per request)\n";
 }
 elseif ($mode == 'processid')
 {
@@ -464,7 +482,7 @@ $total_terms  = 0;
 $total_images = 0;
 $fail_streak  = 0;
 
-$flush = function() use (&$batch, &$batch_chars, &$total_terms, &$total_images, &$fail_streak, $keys, $tablename, $prefix, $label)
+$flush = function() use (&$batch, &$batch_chars, &$total_terms, &$total_images, &$fail_streak, $keys, $tablename, $prefix, $label, $mode, $config)
 {
 	if (count($batch) == 0)
 	{
@@ -491,6 +509,16 @@ $flush = function() use (&$batch, &$batch_chars, &$total_terms, &$total_images, 
 	$fail_streak = 0;
 	$n = count($result['images']);
 	store_batch($batch, $result['images'], $keys, $tablename);
+
+	// Record repaired BINs so an interrupted 'repair' run resumes forward.
+	if ($mode == 'repair')
+	{
+		$rs = $config['pdo']->prepare('INSERT OR IGNORE INTO repaired(bin_uri) VALUES(?)');
+		foreach ($batch as $b)
+		{
+			$rs->execute(array($b));
+		}
+	}
 
 	$total_terms  += count($batch);
 	$total_images += $n;
