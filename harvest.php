@@ -410,9 +410,12 @@ $batch_limit = BATCH_SIZE;   // terms per request (forced to 1 for 'repair')
 
 if ($mode == 'bins')
 {
+	// Optional CLI override of the BIN list:
+	//   php harvest.php bins bioscan_new_bins.csv
+	$bins_file = isset($argv[2]) ? $argv[2] : '../bold-image-harvest-o/all_bins.csv';
 	$done  = load_done_set();
-	$terms = csv_term_stream('../bold-image-harvest-o/all_bins.csv', 'bin_uri', $done);
-	echo "-- mode=bins, " . count($done) . " ids already searched\n";
+	$terms = csv_term_stream($bins_file, 'bin_uri', $done);
+	echo "-- mode=bins, source=$bins_file, " . count($done) . " ids already searched\n";
 }
 elseif ($mode == 'rerun')
 {
@@ -462,10 +465,15 @@ elseif ($mode == 'repair')
 }
 elseif ($mode == 'processid')
 {
-	$prefix = 'ids:processid:';
-	$label  = 'processids';
-	$terms  = orphan_processid_stream('../bold-image-harvest-o/processid.csv');
-	echo "-- mode=processid, fetching orphan processids (not already captured via a BIN)\n";
+	// Optional CLI override of the source list:
+	//   php harvest.php processid bioscan_todo.csv
+	// Default is the broad orphan list; bioscan_todo.csv is the high-yield
+	// (known-has-image) subset derived from the BIOSCAN-5M dataset.
+	$pid_file = isset($argv[2]) ? $argv[2] : '../bold-image-harvest-o/processid.csv';
+	$prefix   = 'ids:processid:';
+	$label    = 'processids';
+	$terms    = orphan_processid_stream($pid_file);
+	echo "-- mode=processid, source=$pid_file, fetching processids not already captured/searched\n";
 }
 else
 {
