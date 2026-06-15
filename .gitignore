@@ -6,3 +6,6 @@ BIOSCAN_5M_Insect_Dataset_metadata.tsv
 bioscan_todo.csv
 STOP_HARVEST
 bioscan_new_bins.csv
+media_todo.csv
+todo.csv
+media.txt
