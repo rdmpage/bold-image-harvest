@@ -471,6 +471,31 @@ function thumb_b2_base($sha1)
 	     . '/' . $sha1;
 }
 
+// Write the thumbnail + its _info.json into a local sha1-sharded mirror (same
+// layout as B2), so a single harvest pass builds both the bucket and the local
+// copy from the bytes already in memory -- no separate B2->local sync (and no
+// egress, and no need to filter our thumbnails out of a bucket shared with
+// other content). Dedups by file existence. Returns false on a write failure.
+function thumb_write_local($root, $sha1, $body, $json)
+{
+	$base = $root . '/' . thumb_b2_base($sha1);
+	$dir  = dirname($base);
+	if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir))
+	{
+		return false;
+	}
+	$ok = true;
+	if (!file_exists($base . '.jpeg'))
+	{
+		$ok = (@file_put_contents($base . '.jpeg', $body) !== false) && $ok;
+	}
+	if (!file_exists($base . '_info.json'))
+	{
+		$ok = (@file_put_contents($base . '_info.json', $json) !== false) && $ok;
+	}
+	return $ok;
+}
+
 // Parse an EXIF rational ("28/10") or number to a float.
 function thumb_rational($v)
 {
@@ -638,6 +663,18 @@ function run_thumbnails($limit = 0)
 	thumb_migrate($pdo);
 	$b2 = new B2();
 
+	// Optional local mirror: set THUMB_MIRROR to a directory (e.g. an external
+	// drive or a NAS mount) and each thumbnail is written there too, in the same
+	// sha1-sharded layout as B2, as it is uploaded. Configurable per run:
+	//   THUMB_MIRROR=/Volumes/Acer/bold-thumbnails ./run_harvest.sh thumbnails
+	$mirror = getenv('THUMB_MIRROR');
+	$mirror = $mirror ? rtrim($mirror, '/') : null;
+	if ($mirror && !is_dir($mirror))
+	{
+		echo "THUMB_MIRROR '$mirror' is not a directory (drive not mounted?)\n";
+		exit(1);
+	}
+
 	// Append-only provenance log, so the bucket is reconstructable even if every
 	// database is lost: one JSON line per stored thumbnail.
 	$manifest = fopen(dirname(__FILE__) . '/thumbnails_manifest.jsonl', 'a');
@@ -646,9 +683,10 @@ function run_thumbnails($limit = 0)
 	$mark_ok   = $pdo->prepare('UPDATE boldcaosimage SET sha1 = ?, size = ?, fetched_at = ? WHERE object_id = ?');
 	$mark_err  = $pdo->prepare('UPDATE boldcaosimage SET fetch_error = ?, fetched_at = ? WHERE object_id = ?');
 
-	echo "-- mode=thumbnails, downloading thumbnail_urls (concurrency " . THUMB_CONCURRENCY . ") -> B2\n";
+	echo "-- mode=thumbnails, downloading thumbnail_urls (concurrency " . THUMB_CONCURRENCY . ") -> B2"
+	   . ($mirror ? " + local mirror $mirror" : "") . "\n";
 
-	$total_ok = 0; $total_dup = 0; $total_err = 0; $fail_streak = 0;
+	$total_ok = 0; $total_dup = 0; $total_err = 0; $fail_streak = 0; $mirror_fail = 0;
 
 	while (true)
 	{
@@ -670,7 +708,8 @@ function run_thumbnails($limit = 0)
 
 		if (count($rows) == 0)
 		{
-			echo "\nDone. Uploaded $total_ok thumbnails ($total_dup dup), $total_err permanent errors.\n";
+			echo "\nDone. Uploaded $total_ok thumbnails ($total_dup dup), $total_err permanent errors"
+			   . ($mirror ? ", $mirror_fail mirror write failures" : "") . ".\n";
 			break;
 		}
 
@@ -776,6 +815,20 @@ function run_thumbnails($limit = 0)
 						$total_dup++;
 					}
 
+					// Write-through to the local mirror (independent of B2 dedup:
+					// writes only if the file is missing there). If the whole
+					// mirror dir has vanished mid-run (drive unmounted/full), stop
+					// rather than silently harvest without mirroring.
+					if ($mirror && !thumb_write_local($mirror, $sha1, $body, $json))
+					{
+						if (!is_dir($mirror))
+						{
+							echo "Local mirror '$mirror' unavailable (unmounted or full?). Stopping.\n";
+							exit(1);
+						}
+						$mirror_fail++;
+					}
+
 					$updates[] = array($r->object_id, $sha1, $size);
 					fwrite($manifest, $json . "\n");
 					$total_ok++;
@@ -805,7 +858,8 @@ function run_thumbnails($limit = 0)
 			fflush($manifest);
 
 			echo "-- sub-batch " . count($sub) . " -> ok $total_ok, dup $total_dup, err $total_err"
-			   . ($batch_transient ? ", transient $batch_transient" : "") . "\n";
+			   . ($batch_transient ? ", transient $batch_transient" : "")
+			   . ($mirror_fail ? ", mirror-fail $mirror_fail" : "") . "\n";
 
 			// Circuit breaker: a whole sub-batch failing transiently, repeatedly,
 			// means the image host or B2 is blocking/down. Stop so the wrapper
