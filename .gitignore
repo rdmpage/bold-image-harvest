@@ -1,4 +1,6 @@
 .DS_Store
+env.php
+thumbnails_manifest.jsonl
 boldcaosimage.db
 rerun.log
 *.log

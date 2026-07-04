@@ -30,6 +30,16 @@ define('SLEEP_MIN_US', 1000000);  // polite delay between batches: 1s ..
 define('SLEEP_MAX_US', 3000000);  // .. 3s
 define('MAX_RETRIES',  4);        // per-batch retries on transport / HTTP errors
 
+// 'thumbnails' mode: download the actual thumbnail bytes for stored image
+// records, hash them, and upload to Backblaze B2 named by SHA1. Sequential
+// fetching is hopeless at ~9M images (the image host 302-redirects to a signed
+// URL, ~2s/image), so downloads run concurrently via curl_multi.
+define('THUMB_CONCURRENCY',  12);       // parallel image downloads per sub-batch
+define('THUMB_CHUNK',        500);      // rows pulled from the DB per iteration
+define('THUMB_POLITENESS_US', 200000);  // pause between sub-batches (0.2s)
+define('THUMB_FAIL_STREAK',  10);       // consecutive all-failed sub-batches -> stop
+                                        // (lets run_harvest.sh cool down & resume)
+
 //----------------------------------------------------------------------------------------
 // HTTP GET. Returns [body, http_code]; body is null on a transport-level failure.
 function get($url)
@@ -89,6 +99,57 @@ function get_json($url, $what)
 	}
 
 	return null;
+}
+
+//----------------------------------------------------------------------------------------
+// Fetch many URLs concurrently. $urls is key => url; returns key => [body, code],
+// body null on transport failure. Same options as get() (follows the image
+// host's 302 to its signed URL). Used by the 'thumbnails' mode; sequential
+// fetching of ~9M images would take months.
+function get_multi($urls)
+{
+	$mh = curl_multi_init();
+	$handles = array();
+
+	foreach ($urls as $key => $url)
+	{
+		$ch = curl_init();
+		curl_setopt_array($ch, array(
+			CURLOPT_URL            => $url,
+			CURLOPT_FOLLOWLOCATION => TRUE,
+			CURLOPT_RETURNTRANSFER => TRUE,
+			CURLOPT_HEADER         => FALSE,
+			CURLOPT_SSL_VERIFYHOST => FALSE,
+			CURLOPT_SSL_VERIFYPEER => FALSE,
+			CURLOPT_CONNECTTIMEOUT => 30,
+			CURLOPT_TIMEOUT        => 120,
+			CURLOPT_USERAGENT      => 'bold-image-harvest/1.0 (mailto:rdmpage@gmail.com)',
+		));
+		curl_multi_add_handle($mh, $ch);
+		$handles[$key] = $ch;
+	}
+
+	// Drive all transfers to completion.
+	do {
+		$status = curl_multi_exec($mh, $running);
+		if ($running)
+		{
+			curl_multi_select($mh, 1.0);
+		}
+	} while ($running && $status == CURLM_OK);
+
+	$results = array();
+	foreach ($handles as $key => $ch)
+	{
+		$body = curl_multi_getcontent($ch);
+		$code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		$results[$key] = array(($body === false || $body === '') ? ($code == 200 ? '' : null) : $body, $code);
+		curl_multi_remove_handle($mh, $ch);
+		curl_close($ch);
+	}
+	curl_multi_close($mh);
+
+	return $results;
 }
 
 //----------------------------------------------------------------------------------------
@@ -381,11 +442,420 @@ $keys = array(
 );
 
 //----------------------------------------------------------------------------------------
+// 'thumbnails' mode support: download stored thumbnail_urls, hash, upload to B2.
+//----------------------------------------------------------------------------------------
+
+// Add the columns the thumbnails pass writes to, if they aren't there yet.
+// Resumability hangs off sha1 IS NULL; fetch_error parks permanently-dead URLs
+// (404/410) so they aren't retried forever.
+function thumb_migrate($pdo)
+{
+	$cols = array();
+	foreach ($pdo->query('PRAGMA table_info(boldcaosimage)') as $r)
+	{
+		$cols[$r['name']] = true;
+	}
+	if (!isset($cols['sha1']))        $pdo->exec('ALTER TABLE boldcaosimage ADD COLUMN sha1 TEXT');
+	if (!isset($cols['size']))        $pdo->exec('ALTER TABLE boldcaosimage ADD COLUMN size INTEGER');
+	if (!isset($cols['fetched_at']))  $pdo->exec('ALTER TABLE boldcaosimage ADD COLUMN fetched_at INTEGER');
+	if (!isset($cols['fetch_error'])) $pdo->exec('ALTER TABLE boldcaosimage ADD COLUMN fetch_error TEXT');
+	$pdo->exec('CREATE INDEX IF NOT EXISTS sha1_idx ON boldcaosimage(sha1)');
+}
+
+// SHA1 -> "ab/cd/ef/<sha1>", the content-store's sharded base path. The content
+// store resolver (content.bionames.org) builds paths this way via
+// create_path_from_hash(), then appends the extension and "_info.json".
+function thumb_b2_base($sha1)
+{
+	return substr($sha1, 0, 2) . '/' . substr($sha1, 2, 2) . '/' . substr($sha1, 4, 2)
+	     . '/' . $sha1;
+}
+
+// Parse an EXIF rational ("28/10") or number to a float.
+function thumb_rational($v)
+{
+	if ($v === null) { return null; }
+	if (is_string($v) && strpos($v, '/') !== false)
+	{
+		list($n, $d) = explode('/', $v, 2);
+		return ($d != 0) ? ($n / $d) : null;
+	}
+	return is_numeric($v) ? (float)$v : null;
+}
+
+// Trim trailing zeros: 3.70 -> "3.7", 2.80 -> "2.8", 5.00 -> "5".
+function thumb_num($f)
+{
+	return rtrim(rtrim(sprintf('%.2f', $f), '0'), '.');
+}
+
+// Extract a CURATED, JSON-safe EXIF block from JPEG bytes, or null if the image
+// carries no usable EXIF (many BOLD thumbnails are stripped; some keep the full
+// camera block). We whitelist scalar tags only -- raw EXIF also holds binary
+// maker-note blobs that would corrupt the JSON -- and add human-readable forms
+// (aperture "f/2.8", shutter "1/125", focal length "3.7 mm") for a Flickr-style
+// display, keeping the raw values alongside for provenance.
+function thumb_extract_exif($body)
+{
+	if (!function_exists('exif_read_data'))
+	{
+		return null;
+	}
+
+	// exif_read_data accepts a stream (PHP >= 7.2), so no temp file on disk.
+	$fp = fopen('php://temp', 'r+');
+	fwrite($fp, $body);
+	rewind($fp);
+	$e = @exif_read_data($fp, null, true);
+	fclose($fp);
+	if (!$e)
+	{
+		return null;
+	}
+
+	$ifd0 = isset($e['IFD0']) ? $e['IFD0'] : array();
+	$exif = isset($e['EXIF']) ? $e['EXIF'] : array();
+	$gps  = isset($e['GPS'])  ? $e['GPS']  : array();
+	$g = function($a, $k) { return isset($a[$k]) ? $a[$k] : null; };
+
+	$out = array();
+
+	// Camera make/model + a combined display string ("Nokia 5530").
+	$make  = $g($ifd0, 'Make');
+	$model = $g($ifd0, 'Model');
+	if ($make)  { $out['make']  = trim($make); }
+	if ($model) { $out['model'] = trim($model); }
+	if ($make || $model)
+	{
+		$camera = trim(trim($make) . ' ' . trim($model));
+		if ($make && $model && stripos(trim($model), trim($make)) === 0)
+		{
+			$camera = trim($model);   // model already includes make
+		}
+		$out['camera'] = $camera;
+	}
+
+	// Date taken -> "2010-06-11 14:48:15".
+	$dt = $g($exif, 'DateTimeOriginal');
+	if (!$dt) { $dt = $g($ifd0, 'DateTime'); }
+	if ($dt && preg_match('/^(\d{4}):(\d{2}):(\d{2}) (.+)$/', $dt, $m))
+	{
+		$out['date_taken'] = "$m[1]-$m[2]-$m[3] $m[4]";
+	}
+	elseif ($dt)
+	{
+		$out['date_taken'] = $dt;
+	}
+
+	// Shutter speed -> "1/125" (or "1.3s" for long exposures).
+	$et = $g($exif, 'ExposureTime');
+	if ($et !== null)
+	{
+		$out['exposure_time'] = $et;   // raw "n/d"
+		$f = thumb_rational($et);
+		if ($f !== null && $f > 0)
+		{
+			$out['exposure'] = ($f < 1) ? ('1/' . round(1 / $f)) : (thumb_num($f) . 's');
+		}
+	}
+
+	// Aperture -> "f/2.8".
+	$fn = thumb_rational($g($exif, 'FNumber'));
+	if ($fn !== null)
+	{
+		$out['fnumber']  = round($fn, 1);
+		$out['aperture'] = 'f/' . thumb_num($fn);
+	}
+
+	// ISO.
+	$iso = $g($exif, 'ISOSpeedRatings');
+	if (is_array($iso)) { $iso = reset($iso); }
+	if ($iso !== null) { $out['iso'] = (int)$iso; }
+
+	// Focal length -> "3.7 mm".
+	$fl = thumb_rational($g($exif, 'FocalLength'));
+	if ($fl !== null)
+	{
+		$out['focal_length_mm'] = round($fl, 1);
+		$out['focal_length']    = thumb_num($fl) . ' mm';
+	}
+
+	// Flash: keep the raw bitmask + a simple "did it fire" flag (bit 0).
+	$flash = $g($exif, 'Flash');
+	if ($flash !== null)
+	{
+		$out['flash']       = (int)$flash;
+		$out['flash_fired'] = ((int)$flash & 1) === 1;
+	}
+
+	$or = $g($ifd0, 'Orientation');
+	if ($or !== null) { $out['orientation'] = (int)$or; }
+
+	$cs = $g($exif, 'ColorSpace');
+	if ($cs !== null) { $out['color_space'] = ($cs == 1) ? 'sRGB' : (string)$cs; }
+
+	// Original capture dimensions (the thumbnail is downscaled from these).
+	$ow = $g($exif, 'ExifImageWidth');
+	$oh = $g($exif, 'ExifImageLength');
+	if ($ow) { $out['original_width']  = (int)$ow; }
+	if ($oh) { $out['original_height'] = (int)$oh; }
+
+	// GPS: DMS rationals + hemisphere ref -> signed decimal degrees.
+	if ($gps)
+	{
+		$dms = function($a, $ref) use ($g)
+		{
+			if (!is_array($a) || count($a) < 3) { return null; }
+			$deg = thumb_rational($a[0]);
+			if ($deg === null) { return null; }
+			$dec = $deg + thumb_rational($a[1]) / 60 + thumb_rational($a[2]) / 3600;
+			if ($ref === 'S' || $ref === 'W') { $dec = -$dec; }
+			return round($dec, 6);
+		};
+		$lat = $dms($g($gps, 'GPSLatitude'),  $g($gps, 'GPSLatitudeRef'));
+		$lon = $dms($g($gps, 'GPSLongitude'), $g($gps, 'GPSLongitudeRef'));
+		if ($lat !== null && $lon !== null)
+		{
+			$out['gps'] = array('latitude' => $lat, 'longitude' => $lon);
+		}
+	}
+
+	return $out ? $out : null;
+}
+
+// Download stored thumbnails concurrently, hash, upload to B2 by SHA1, and record
+// sha1/size back onto each row. Content-addressed: identical bytes dedupe to one
+// object. A row is done once sha1 is set; interrupted runs resume cleanly, and
+// run_harvest.sh restarts us after the circuit breaker trips on a run of failures.
+function run_thumbnails($limit = 0)
+{
+	global $config;
+	$pdo = $config['pdo'];
+
+	require_once (dirname(__FILE__) . '/env.php');   // B2 credentials (gitignored)
+	require_once (dirname(__FILE__) . '/b2.php');
+
+	thumb_migrate($pdo);
+	$b2 = new B2();
+
+	// Append-only provenance log, so the bucket is reconstructable even if every
+	// database is lost: one JSON line per stored thumbnail.
+	$manifest = fopen(dirname(__FILE__) . '/thumbnails_manifest.jsonl', 'a');
+
+	$have_sha1 = $pdo->prepare('SELECT 1 FROM boldcaosimage WHERE sha1 = ? LIMIT 1');
+	$mark_ok   = $pdo->prepare('UPDATE boldcaosimage SET sha1 = ?, size = ?, fetched_at = ? WHERE object_id = ?');
+	$mark_err  = $pdo->prepare('UPDATE boldcaosimage SET fetch_error = ?, fetched_at = ? WHERE object_id = ?');
+
+	echo "-- mode=thumbnails, downloading thumbnail_urls (concurrency " . THUMB_CONCURRENCY . ") -> B2\n";
+
+	$total_ok = 0; $total_dup = 0; $total_err = 0; $fail_streak = 0;
+
+	while (true)
+	{
+		if (file_exists(dirname(__FILE__) . '/STOP_HARVEST'))
+		{
+			echo "STOP_HARVEST present; stopping.\n";
+			break;
+		}
+
+		$chunk = ($limit > 0) ? min($limit, THUMB_CHUNK) : THUMB_CHUNK;
+		// Pull the whole specimen record: it all goes into the _info.json sidecar
+		// so the bucket alone is enough to reconstruct provenance if the DBs die.
+		$rows = db_get('SELECT object_id, image_url, thumbnail_url, file_name, processid,'
+		             . ' sampleid, taxon, bin_uri, copyright_holder, copyright_year,'
+		             . ' copyright_license, copyright_institution, photographer'
+		             . ' FROM boldcaosimage'
+		             . ' WHERE sha1 IS NULL AND fetch_error IS NULL AND thumbnail_url IS NOT NULL'
+		             . ' LIMIT ' . $chunk);
+
+		if (count($rows) == 0)
+		{
+			echo "\nDone. Uploaded $total_ok thumbnails ($total_dup dup), $total_err permanent errors.\n";
+			break;
+		}
+
+		foreach (array_chunk($rows, THUMB_CONCURRENCY) as $sub)
+		{
+			$urls = array();
+			foreach ($sub as $i => $r)
+			{
+				$urls[$i] = $r->thumbnail_url;
+			}
+			$fetched = get_multi($urls);
+
+			// Downloads + B2 uploads happen OUTSIDE any transaction (they're slow
+			// and would block the metadata harvest sharing this DB). We collect
+			// per-row outcomes, then apply them in one short transaction.
+			$updates = array();   // [object_id, sha1, size]
+			$errors  = array();   // [object_id, code]
+			$batch_transient = 0;
+
+			foreach ($sub as $i => $r)
+			{
+				list($body, $code) = $fetched[$i];
+
+				if ($body !== null && $body !== '' && $code == 200)
+				{
+					$sha1 = sha1($body);
+					$size = strlen($body);
+
+					// Build the full provenance record once: it is both the
+					// _info.json sidecar and the manifest line, so the two can
+					// never diverge. Only columns actually present are included
+					// (db_get drops empty ones), keeping the JSON clean.
+					$cols = array(
+						'thumbnail_url' => 'url',        // the bytes stored here
+						'image_url'     => 'image_url',  // full-res original at BOLD
+						'object_id'     => 'object_id',
+						'file_name'     => 'file_name',
+						'processid'     => 'processid',
+						'sampleid'      => 'sampleid',
+						'taxon'         => 'taxon',
+						'bin_uri'       => 'bin_uri',
+						'copyright_holder'      => 'copyright_holder',
+						'copyright_year'        => 'copyright_year',
+						'copyright_license'     => 'copyright_license',
+						'copyright_institution' => 'copyright_institution',
+						'photographer'          => 'photographer',
+					);
+					$source = array();
+					foreach ($cols as $col => $key)
+					{
+						if (isset($r->{$col}))
+						{
+							$source[$key] = $r->{$col};
+						}
+					}
+					// sha1/size/mimetype/md5 stay top-level; mimetype is the one
+					// field the content-store resolver actually reads.
+					$record = array(
+						'sha1'     => $sha1,
+						'size'     => $size,
+						'md5'      => md5($body),
+						'mimetype' => 'image/jpeg',
+					);
+					// Pixel dimensions (+ depth/channels) straight from the bytes
+					// -- no temp file, no EXIF (which BOLD's thumbnails don't carry).
+					$dim = @getimagesizefromstring($body);
+					if ($dim !== false)
+					{
+						$record['width']  = $dim[0];
+						$record['height'] = $dim[1];
+						if (isset($dim['bits']))     { $record['bits']     = $dim['bits']; }
+						if (isset($dim['channels'])) { $record['channels'] = $dim['channels']; }
+					}
+					// Camera EXIF (make/model, exposure, GPS, ...) when the
+					// thumbnail carries it -- omitted entirely when it doesn't.
+					$exif = thumb_extract_exif($body);
+					if ($exif) { $record['exif'] = $exif; }
+
+					$record['source']       = $source;
+					$record['harvested_at'] = time();
+					// SUBSTITUTE guards against a stray non-UTF-8 byte in an EXIF
+					// string turning the whole encode into false.
+					$json = json_encode($record, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE);
+
+					$have_sha1->execute(array($sha1));
+					$dup = (bool)$have_sha1->fetchColumn(0);
+
+					if (!$dup)
+					{
+						// The resolver needs BOTH the image (named with the
+						// mime2ext extension -- 'jpeg' for image/jpeg) and the
+						// "<sha1>_info.json" sidecar it reads to get the mimetype.
+						$base = thumb_b2_base($sha1);
+						if (!$b2->uploadBytes($body, $base . '.jpeg', $sha1)
+						 || !$b2->uploadBytes($json, $base . '_info.json', sha1($json), 'application/json'))
+						{
+							$batch_transient++;   // B2 hiccup: retry this row next pass
+							continue;
+						}
+					}
+					else
+					{
+						$total_dup++;
+					}
+
+					$updates[] = array($r->object_id, $sha1, $size);
+					fwrite($manifest, $json . "\n");
+					$total_ok++;
+				}
+				elseif ($body !== null && $code >= 400 && $code < 500 && $code != 429)
+				{
+					$errors[] = array($r->object_id, $code);   // permanent: 404/410/etc
+					$total_err++;
+				}
+				else
+				{
+					$batch_transient++;   // transport 0, 5xx, 429: retry next pass
+				}
+			}
+
+			$now = time();
+			$pdo->beginTransaction();
+			foreach ($updates as $u)
+			{
+				$mark_ok->execute(array($u[1], $u[2], $now, $u[0]));
+			}
+			foreach ($errors as $e)
+			{
+				$mark_err->execute(array('http ' . $e[1], $now, $e[0]));
+			}
+			$pdo->commit();
+			fflush($manifest);
+
+			echo "-- sub-batch " . count($sub) . " -> ok $total_ok, dup $total_dup, err $total_err"
+			   . ($batch_transient ? ", transient $batch_transient" : "") . "\n";
+
+			// Circuit breaker: a whole sub-batch failing transiently, repeatedly,
+			// means the image host or B2 is blocking/down. Stop so the wrapper
+			// cools down and resumes.
+			if ($batch_transient == count($sub))
+			{
+				$fail_streak++;
+				if ($fail_streak >= THUMB_FAIL_STREAK)
+				{
+					echo "Too many consecutive failures; the image host or B2 may be blocking or down. Stopping.\n";
+					exit(1);
+				}
+			}
+			else
+			{
+				$fail_streak = 0;
+			}
+
+			usleep(THUMB_POLITENESS_US);
+		}
+
+		// Spot-check mode: one chunk is enough.
+		if ($limit > 0)
+		{
+			echo "\nLimit reached ($limit): stopping after test run. Uploaded $total_ok ($total_dup dup), $total_err errors.\n";
+			break;
+		}
+	}
+
+	fclose($manifest);
+}
+
+//----------------------------------------------------------------------------------------
 // Allow the file to be included (e.g. for testing the functions above) without
 // kicking off the full harvest.
 if (getenv('HARVEST_NO_RUN'))
 {
 	return;
+}
+
+//----------------------------------------------------------------------------------------
+// 'thumbnails' is a different job from the metadata modes below (it reads stored
+// rows and fetches image bytes, rather than querying BOLD), so branch early.
+if (isset($argv[1]) && ($argv[1] == 'thumbnails' || $argv[1] == 'download'))
+{
+	// Optional cap for spot-checks: `php harvest.php thumbnails 10` fetches ~10
+	// and stops. 0/absent = run to completion.
+	$limit = isset($argv[2]) ? (int)$argv[2] : 0;
+	run_thumbnails($limit);
+	exit(0);
 }
 
 //----------------------------------------------------------------------------------------
