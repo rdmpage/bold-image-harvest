@@ -34,7 +34,7 @@ define('MAX_RETRIES',  4);        // per-batch retries on transport / HTTP error
 // records, hash them, and upload to Backblaze B2 named by SHA1. Sequential
 // fetching is hopeless at ~9M images (the image host 302-redirects to a signed
 // URL, ~2s/image), so downloads run concurrently via curl_multi.
-define('THUMB_CONCURRENCY',  12);       // parallel image downloads per sub-batch
+define('THUMB_CONCURRENCY',  20);       // parallel image downloads + B2 upload pool
 define('THUMB_CHUNK',        500);      // rows pulled from the DB per iteration
 define('THUMB_POLITENESS_US', 200000);  // pause between sub-batches (0.2s)
 define('THUMB_FAIL_STREAK',  10);       // consecutive all-failed sub-batches -> stop
@@ -722,13 +722,16 @@ function run_thumbnails($limit = 0)
 			}
 			$fetched = get_multi($urls);
 
-			// Downloads + B2 uploads happen OUTSIDE any transaction (they're slow
-			// and would block the metadata harvest sharing this DB). We collect
-			// per-row outcomes, then apply them in one short transaction.
-			$updates = array();   // [object_id, sha1, size]
-			$errors  = array();   // [object_id, code]
+			// Downloads + B2 uploads + local writes happen OUTSIDE any
+			// transaction (slow, and would block the metadata DB). We prepare
+			// per-row records, upload the whole sub-batch in parallel, then
+			// apply the DB updates in one short transaction.
+			$updates  = array();   // [object_id, sha1, size]
+			$errors   = array();   // [object_id, code]
+			$prepared = array();   // successful downloads awaiting upload
 			$batch_transient = 0;
 
+			// Phase 1: turn each download into a prepared record (no network).
 			foreach ($sub as $i => $r)
 			{
 				list($body, $code) = $fetched[$i];
@@ -797,41 +800,10 @@ function run_thumbnails($limit = 0)
 					$have_sha1->execute(array($sha1));
 					$dup = (bool)$have_sha1->fetchColumn(0);
 
-					if (!$dup)
-					{
-						// The resolver needs BOTH the image (named with the
-						// mime2ext extension -- 'jpeg' for image/jpeg) and the
-						// "<sha1>_info.json" sidecar it reads to get the mimetype.
-						$base = thumb_b2_base($sha1);
-						if (!$b2->uploadBytes($body, $base . '.jpeg', $sha1)
-						 || !$b2->uploadBytes($json, $base . '_info.json', sha1($json), 'application/json'))
-						{
-							$batch_transient++;   // B2 hiccup: retry this row next pass
-							continue;
-						}
-					}
-					else
-					{
-						$total_dup++;
-					}
-
-					// Write-through to the local mirror (independent of B2 dedup:
-					// writes only if the file is missing there). If the whole
-					// mirror dir has vanished mid-run (drive unmounted/full), stop
-					// rather than silently harvest without mirroring.
-					if ($mirror && !thumb_write_local($mirror, $sha1, $body, $json))
-					{
-						if (!is_dir($mirror))
-						{
-							echo "Local mirror '$mirror' unavailable (unmounted or full?). Stopping.\n";
-							exit(1);
-						}
-						$mirror_fail++;
-					}
-
-					$updates[] = array($r->object_id, $sha1, $size);
-					fwrite($manifest, $json . "\n");
-					$total_ok++;
+					$prepared[] = array(
+						'r' => $r, 'sha1' => $sha1, 'size' => $size,
+						'body' => $body, 'json' => $json, 'dup' => $dup,
+					);
 				}
 				elseif ($body !== null && $code >= 400 && $code < 500 && $code != 429)
 				{
@@ -842,6 +814,55 @@ function run_thumbnails($limit = 0)
 				{
 					$batch_transient++;   // transport 0, 5xx, 429: retry next pass
 				}
+			}
+
+			// Phase 2: upload every non-dup object (jpeg + info.json) in PARALLEL
+			// -- the single biggest speedup, since serial B2 PUT latency (~0.5s
+			// each, 24 per sub-batch) dominated the wall-clock.
+			$items = array(); $img_keys = array();
+			foreach ($prepared as $pi => $p)
+			{
+				if ($p['dup']) { continue; }
+				$base = thumb_b2_base($p['sha1']);
+				$items['j' . $pi] = array('bytes' => $p['body'], 'name' => $base . '.jpeg',
+				                          'sha1' => $p['sha1'], 'mimetype' => 'image/jpeg');
+				$items['i' . $pi] = array('bytes' => $p['json'], 'name' => $base . '_info.json',
+				                          'sha1' => sha1($p['json']), 'mimetype' => 'application/json');
+				$img_keys[$pi] = array('j' . $pi, 'i' . $pi);
+			}
+			$upres = count($items) ? $b2->uploadBatch($items, THUMB_CONCURRENCY) : array();
+
+			// Phase 3: finalize -- mirror-write and record every image whose
+			// uploads succeeded (dups need no upload); failed uploads retry.
+			foreach ($prepared as $pi => $p)
+			{
+				if ($p['dup'])
+				{
+					$total_dup++;
+				}
+				elseif (empty($upres[$img_keys[$pi][0]]) || empty($upres[$img_keys[$pi][1]]))
+				{
+					$batch_transient++;   // an upload failed: retry next pass
+					continue;
+				}
+
+				// Write-through to the local mirror (independent of B2 dedup:
+				// writes only if the file is missing there). If the whole mirror
+				// dir has vanished mid-run (unmounted/full), stop rather than
+				// silently harvest without mirroring.
+				if ($mirror && !thumb_write_local($mirror, $p['sha1'], $p['body'], $p['json']))
+				{
+					if (!is_dir($mirror))
+					{
+						echo "Local mirror '$mirror' unavailable (unmounted or full?). Stopping.\n";
+						exit(1);
+					}
+					$mirror_fail++;
+				}
+
+				$updates[] = array($p['r']->object_id, $p['sha1'], $p['size']);
+				fwrite($manifest, $p['json'] . "\n");
+				$total_ok++;
 			}
 
 			$now = time();

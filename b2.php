@@ -21,6 +21,7 @@ class B2
 
 	private $uploadUrl;
 	private $uploadAuthToken;
+	private $pool = array();   // pool of upload url/token pairs for parallel uploads
 
 	function __construct()
 	{
@@ -73,7 +74,10 @@ class B2
 	// b2_get_upload_url: a single-use-ish endpoint + token for uploads. B2 hands
 	// out a specific machine; on 401/503 you must fetch a fresh one, which is
 	// what uploadBytes() does on failure.
-	private function refreshUploadUrl()
+	// One b2_get_upload_url call -> ['url'=>, 'token'=>] or null. B2 gives a
+	// distinct endpoint each call, and each can only serve one upload at a time,
+	// so parallel uploads need one pair per concurrent connection (see the pool).
+	private function getUploadUrlPair()
 	{
 		$ch = curl_init($this->apiUrl . '/b2api/v2/b2_get_upload_url');
 		curl_setopt($ch, CURLOPT_POST, true);
@@ -81,9 +85,7 @@ class B2
 		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 		curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
 		curl_setopt($ch, CURLOPT_TIMEOUT, 60);
-		curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-			'Authorization: ' . $this->accountAuthToken,
-		));
+		curl_setopt($ch, CURLOPT_HTTPHEADER, array('Authorization: ' . $this->accountAuthToken));
 		$body = curl_exec($ch);
 		$code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 		curl_close($ch);
@@ -91,12 +93,108 @@ class B2
 		$r = json_decode($body, true);
 		if ($code != 200 || !isset($r['uploadUrl']))
 		{
-			return false;
+			return null;
+		}
+		return array('url' => $r['uploadUrl'], 'token' => $r['authorizationToken']);
+	}
+
+	private function refreshUploadUrl()
+	{
+		$p = $this->getUploadUrlPair();
+		if (!$p) { return false; }
+		$this->uploadUrl       = $p['url'];
+		$this->uploadAuthToken = $p['token'];
+		return true;
+	}
+
+	// Ensure pool slots 0..n-1 hold a usable upload url/token pair.
+	private function ensurePool($n)
+	{
+		for ($i = 0; $i < $n; $i++)
+		{
+			if (empty($this->pool[$i]))
+			{
+				$p = $this->getUploadUrlPair();
+				if (!$p) { $this->authorize(); $p = $this->getUploadUrlPair(); }
+				$this->pool[$i] = $p;   // may stay null; uploadBatch falls back per item
+			}
+		}
+	}
+
+	// Upload many objects concurrently over a pool of upload URLs, in waves of
+	// $poolSize (one URL per in-flight connection). $items: key => [bytes, name,
+	// sha1, mimetype]. Returns key => bool. Any failure is retried once via the
+	// sequential path (fresh URL / re-auth), so token expiry self-heals.
+	function uploadBatch($items, $poolSize = 12)
+	{
+		$results = array();
+		$keys = array_keys($items);
+		$this->ensurePool($poolSize);
+
+		for ($off = 0; $off < count($keys); $off += $poolSize)
+		{
+			$wave = array_slice($keys, $off, $poolSize);
+			$mh = curl_multi_init();
+			$handles = array();
+			$slot = 0;
+			foreach ($wave as $k)
+			{
+				$pair = isset($this->pool[$slot]) ? $this->pool[$slot] : null;
+				if (!$pair) { $results[$k] = false; $slot++; continue; }
+				$it = $items[$k];
+				$ch = curl_init();
+				curl_setopt_array($ch, array(
+					CURLOPT_URL            => $pair['url'],
+					CURLOPT_POST           => true,
+					CURLOPT_POSTFIELDS     => $it['bytes'],
+					CURLOPT_RETURNTRANSFER => true,
+					CURLOPT_CONNECTTIMEOUT => 30,
+					CURLOPT_TIMEOUT        => 120,
+					CURLOPT_HTTPHEADER     => array(
+						'Authorization: ' . $pair['token'],
+						'X-Bz-File-Name: ' . rawurlencode($it['name']),
+						'Content-Type: ' . (isset($it['mimetype']) ? $it['mimetype'] : 'image/jpeg'),
+						'Content-Length: ' . strlen($it['bytes']),
+						'X-Bz-Content-Sha1: ' . $it['sha1'],
+					),
+				));
+				curl_multi_add_handle($mh, $ch);
+				$handles[$k] = array($ch, $slot);
+				$slot++;
+			}
+
+			do {
+				$st = curl_multi_exec($mh, $running);
+				if ($running) { curl_multi_select($mh, 1.0); }
+			} while ($running && $st == CURLM_OK);
+
+			foreach ($handles as $k => $hs)
+			{
+				list($ch, $si) = $hs;
+				$code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+				$results[$k] = ($code == 200);
+				if ($code == 401 || $code == 503 || $code == 0)
+				{
+					$this->pool[$si] = null;   // stale endpoint: refill before next wave
+				}
+				curl_multi_remove_handle($mh, $ch);
+				curl_close($ch);
+			}
+			curl_multi_close($mh);
+			$this->ensurePool($poolSize);
 		}
 
-		$this->uploadUrl       = $r['uploadUrl'];
-		$this->uploadAuthToken = $r['authorizationToken'];
-		return true;
+		// Retry any failures once, sequentially (fresh URL + possible re-auth).
+		foreach ($results as $k => $ok)
+		{
+			if (!$ok)
+			{
+				$it = $items[$k];
+				$results[$k] = $this->uploadBytes($it['bytes'], $it['name'], $it['sha1'],
+					isset($it['mimetype']) ? $it['mimetype'] : 'image/jpeg');
+			}
+		}
+		return $results;
 	}
 
 	// One raw upload attempt. Returns the HTTP code (0 on transport failure).
