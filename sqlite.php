@@ -6,6 +6,11 @@ $config['pdo'] = new PDO('sqlite:boldcaosimage.db');
 // processes (e.g. a 'bins' and a 'processid' run) can share the database.
 $config['pdo']->exec('PRAGMA busy_timeout = 30000');
 
+// WAL lets readers and a writer proceed without blocking each other, so the
+// metadata gap-fill (bins/processid) and the thumbnail harvest can run
+// concurrently. Persistent once set; harmless to re-assert each run.
+$config['pdo']->exec('PRAGMA journal_mode = WAL');
+
 //----------------------------------------------------------------------------------------
 // retrieve data from database
 function db_get($sql)

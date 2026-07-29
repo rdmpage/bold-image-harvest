@@ -262,6 +262,10 @@ function store_batch($bins, $images, $keys, $tablename)
 	global $config;
 	$pdo = $config['pdo'];
 
+	// Roll back any transaction a previous batch left open (e.g. a silent
+	// commit/exec failure under lock contention) so we never fatally hit
+	// "there is already an active transaction" on the next begin.
+	if ($pdo->inTransaction()) { $pdo->rollBack(); }
 	$pdo->beginTransaction();
 
 	// Insert / update images. On conflict, backfill bin_uri onto rows that may
@@ -866,6 +870,7 @@ function run_thumbnails($limit = 0)
 			}
 
 			$now = time();
+			if ($pdo->inTransaction()) { $pdo->rollBack(); }
 			$pdo->beginTransaction();
 			foreach ($updates as $u)
 			{
