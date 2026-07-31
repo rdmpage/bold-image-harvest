@@ -869,18 +869,40 @@ function run_thumbnails($limit = 0)
 				$total_ok++;
 			}
 
+			// Phase 4: record results. Retry the whole transaction on lock
+			// contention -- a heavy concurrent metadata harvest (bins/processid)
+			// can hold SQLite's single writer, and PDO is in SILENT mode, so we
+			// check return values and back off rather than silently dropping the
+			// updates (which stranded ~218k already-stored images once). Worst
+			// case: warn and leave the rows for the next pass; the images are
+			// already safe in B2 / the mirror / the manifest.
 			$now = time();
-			if ($pdo->inTransaction()) { $pdo->rollBack(); }
-			$pdo->beginTransaction();
-			foreach ($updates as $u)
+			$committed = false;
+			for ($attempt = 1; $attempt <= 8 && !$committed; $attempt++)
 			{
-				$mark_ok->execute(array($u[1], $u[2], $now, $u[0]));
+				if ($pdo->inTransaction()) { $pdo->rollBack(); }
+				$pdo->beginTransaction();
+				$ok = true;
+				foreach ($updates as $u)
+				{
+					$ok = $mark_ok->execute(array($u[1], $u[2], $now, $u[0])) && $ok;
+				}
+				foreach ($errors as $e)
+				{
+					$ok = $mark_err->execute(array('http ' . $e[1], $now, $e[0])) && $ok;
+				}
+				$committed = $ok && $pdo->commit();
+				if (!$committed)
+				{
+					if ($pdo->inTransaction()) { $pdo->rollBack(); }
+					usleep(500000 * $attempt);   // 0.5s, 1s, 1.5s ... back off
+				}
 			}
-			foreach ($errors as $e)
+			if (!$committed)
 			{
-				$mark_err->execute(array('http ' . $e[1], $now, $e[0]));
+				echo "-- WARN: DB commit failed after retries; " . count($updates)
+				   . " rows retried next pass (images already stored)\n";
 			}
-			$pdo->commit();
 			fflush($manifest);
 
 			echo "-- sub-batch " . count($sub) . " -> ok $total_ok, dup $total_dup, err $total_err"
