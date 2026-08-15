@@ -34,7 +34,12 @@ define('MAX_RETRIES',  4);        // per-batch retries on transport / HTTP error
 // records, hash them, and upload to Backblaze B2 named by SHA1. Sequential
 // fetching is hopeless at ~9M images (the image host 302-redirects to a signed
 // URL, ~2s/image), so downloads run concurrently via curl_multi.
-define('THUMB_CONCURRENCY',  20);       // parallel image downloads + B2 upload pool
+// Both network legs are latency-bound, not bandwidth-bound (~14KB/image), so
+// this is the main throughput dial. Override per run: THUMB_CONCURRENCY=60.
+// Measured 2026-08-14: 20 -> 2.97 img/s, 40 -> 3.85, 60 -> 3.81 (and 60 starts
+// throwing 15s+ B2 upload stalls), so throughput plateaus around 40.
+define('THUMB_CONCURRENCY',
+	getenv('THUMB_CONCURRENCY') ? (int)getenv('THUMB_CONCURRENCY') : 40);
 define('THUMB_CHUNK',        500);      // rows pulled from the DB per iteration
 define('THUMB_POLITENESS_US', 200000);  // pause between sub-batches (0.2s)
 define('THUMB_FAIL_STREAK',  10);       // consecutive all-failed sub-batches -> stop
@@ -108,7 +113,19 @@ function get_json($url, $what)
 // fetching of ~9M images would take months.
 function get_multi($urls)
 {
-	$mh = curl_multi_init();
+	// One multi handle for the whole run. libcurl's connection cache hangs off
+	// the multi handle, not the easy handles, so keeping it alive lets each
+	// sub-batch reuse the sockets the last one opened. Rebuilding it per batch
+	// cost a fresh DNS + TCP + TLS per image (~0.77s of a ~2.0s request), paid
+	// twice over because the host 302-redirects to a signed URL on another host.
+	static $mh = null;
+	if ($mh === null)
+	{
+		$mh = curl_multi_init();
+		// Room for both hops of every in-flight request, so a warm socket is
+		// never evicted just because the batch is at full concurrency.
+		curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, THUMB_CONCURRENCY * 4);
+	}
 	$handles = array();
 
 	foreach ($urls as $key => $url)
@@ -144,10 +161,11 @@ function get_multi($urls)
 		$body = curl_multi_getcontent($ch);
 		$code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 		$results[$key] = array(($body === false || $body === '') ? ($code == 200 ? '' : null) : $body, $code);
+		// Removing an easy handle leaves its connection in the multi handle's
+		// cache, so closing the easy handle here doesn't drop the socket.
 		curl_multi_remove_handle($mh, $ch);
 		curl_close($ch);
 	}
-	curl_multi_close($mh);
 
 	return $results;
 }

@@ -134,6 +134,11 @@ class B2
 		for ($off = 0; $off < count($keys); $off += $poolSize)
 		{
 			$wave = array_slice($keys, $off, $poolSize);
+			// Deliberately a fresh multi handle per wave. Persisting it to reuse
+			// connections (as the download side does) backfired: a b2_get_upload_url
+			// endpoint is pinned to one machine and goes stale between waves, so
+			// cached sockets hung until CURLOPT_TIMEOUT -- measured 15-125s stalls
+			// against a normal 2.5-3s wave. Re-handshaking is far cheaper.
 			$mh = curl_multi_init();
 			$handles = array();
 			$slot = 0;
