@@ -733,7 +733,12 @@ function run_thumbnails($limit = 0)
 			{
 				$urls[$i] = $r->thumbnail_url;
 			}
+			// Per-phase wall clock, for diagnosing where a sub-batch's time goes.
+			// Set THUMB_TIMING=1 to append the breakdown to the sub-batch line.
+			$timing = getenv('THUMB_TIMING');
+			$t_sub = microtime(true);
 			$fetched = get_multi($urls);
+			$t_download = microtime(true) - $t_sub;
 
 			// Downloads + B2 uploads + local writes happen OUTSIDE any
 			// transaction (slow, and would block the metadata DB). We prepare
@@ -843,10 +848,15 @@ function run_thumbnails($limit = 0)
 				                          'sha1' => sha1($p['json']), 'mimetype' => 'application/json');
 				$img_keys[$pi] = array('j' . $pi, 'i' . $pi);
 			}
+			$t_mark = microtime(true);
+			$t_prepare = $t_mark - $t_sub - $t_download;
 			$upres = count($items) ? $b2->uploadBatch($items, THUMB_CONCURRENCY) : array();
+			$t_upload = microtime(true) - $t_mark;
+			$n_uploaded = count($items);
 
 			// Phase 3: finalize -- mirror-write and record every image whose
 			// uploads succeeded (dups need no upload); failed uploads retry.
+			$t_finalize = microtime(true);
 			foreach ($prepared as $pi => $p)
 			{
 				if ($p['dup'])
@@ -877,6 +887,9 @@ function run_thumbnails($limit = 0)
 				fwrite($manifest, $p['json'] . "\n");
 				$total_ok++;
 			}
+
+			$t_mirror = microtime(true) - $t_finalize;
+			$t_db = microtime(true);
 
 			// Phase 4: record results. Retry the whole transaction on lock
 			// contention -- a heavy concurrent metadata harvest (bins/processid)
@@ -916,7 +929,13 @@ function run_thumbnails($limit = 0)
 
 			echo "-- sub-batch " . count($sub) . " -> ok $total_ok, dup $total_dup, err $total_err"
 			   . ($batch_transient ? ", transient $batch_transient" : "")
-			   . ($mirror_fail ? ", mirror-fail $mirror_fail" : "") . "\n";
+			   . ($mirror_fail ? ", mirror-fail $mirror_fail" : "")
+			   . ($timing ? sprintf(" | download %.2fs, prepare %.2fs, upload %.2fs (%d objs),"
+			                        . " mirror %.2fs, db %.2fs, total %.2fs",
+			                        $t_download, $t_prepare, $t_upload, $n_uploaded,
+			                        $t_mirror, microtime(true) - $t_db,
+			                        microtime(true) - $t_sub) : "")
+			   . "\n";
 
 			// Circuit breaker: a whole sub-batch failing transiently, repeatedly,
 			// means the image host or B2 is blocking/down. Stop so the wrapper
