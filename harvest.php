@@ -680,8 +680,17 @@ function run_thumbnails($limit = 0)
 	}
 
 	// Append-only provenance log, so the bucket is reconstructable even if every
-	// database is lost: one JSON line per stored thumbnail.
-	$manifest = fopen(dirname(__FILE__) . '/thumbnails_manifest.jsonl', 'a');
+	// database is lost: one JSON line per stored thumbnail. The file lives on the
+	// external drive and is reached through a symlink here, so bail out loudly if
+	// it can't be opened -- a silent failure would lose the provenance for every
+	// thumbnail this pass stores.
+	$manifest_path = dirname(__FILE__) . '/thumbnails_manifest.jsonl';
+	$manifest = fopen($manifest_path, 'a');
+	if ($manifest === false)
+	{
+		echo "Can't open manifest '$manifest_path' for append (drive not mounted?)\n";
+		exit(1);
+	}
 
 	$have_sha1 = $pdo->prepare('SELECT 1 FROM boldcaosimage WHERE sha1 = ? LIMIT 1');
 	$mark_ok   = $pdo->prepare('UPDATE boldcaosimage SET sha1 = ?, size = ?, fetched_at = ? WHERE object_id = ?');
