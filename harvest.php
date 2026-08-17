@@ -702,8 +702,14 @@ function run_thumbnails($limit = 0)
 	// external drive and is reached through a symlink here, so bail out loudly if
 	// it can't be opened -- a silent failure would lose the provenance for every
 	// thumbnail this pass stores.
-	$manifest_path = dirname(__FILE__) . '/thumbnails_manifest.jsonl';
-	$manifest = fopen($manifest_path, 'a');
+	// THUMB_MANIFEST overrides the location for a run whose mirror is staged
+	// elsewhere (see travel.sh) -- the drive holding the real manifest isn't
+	// attached, so the symlink would dangle. Only ever an override: the default
+	// stays the symlink, so a normal launch can't silently start a second log.
+	$manifest_path = getenv('THUMB_MANIFEST')
+	               ? getenv('THUMB_MANIFEST')
+	               : dirname(__FILE__) . '/thumbnails_manifest.jsonl';
+	$manifest = @fopen($manifest_path, 'a');
 	if ($manifest === false)
 	{
 		echo "Can't open manifest '$manifest_path' for append (drive not mounted?)\n";
