@@ -4,6 +4,7 @@ thumbnails_manifest.jsonl
 staging/
 *.tsv
 *.tsv.gz
+*.zip
 boldcaosimage.db
 boldcaosimage.db-shm
 boldcaosimage.db-wal
