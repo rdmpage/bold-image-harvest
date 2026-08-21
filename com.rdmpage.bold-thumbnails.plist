@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps the thumbnail harvest running without being babysat.
+
+  Install:
+    cp com.rdmpage.bold-thumbnails.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rdmpage.bold-thumbnails.plist
+
+  Stop for good:
+    launchctl bootout gui/$(id -u)/com.rdmpage.bold-thumbnails
+
+  Pause without uninstalling: touch STOP_HARVEST (./resume.sh clears it).
+
+  KeepAlive/PathState ties the job to the LaCie: launchd runs it while the
+  mirror is mounted and stops it when the drive goes away, so plugging the
+  drive in is all it takes to resume. RunAtLoad plus the agent loading at
+  login is what gets it through a reboot.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.rdmpage.bold-thumbnails</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/rpage/Development/bold-image-harvest/launchd-thumbnails.sh</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/rpage/Development/bold-image-harvest</string>
+
+	<!-- A LaunchAgent gets a bare environment: php is a homebrew keg-only 7.4,
+	     so without this PATH the harvest dies on "php: command not found". -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/opt/php@7.4/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>THUMB_MIRROR</key>
+		<string>/Volumes/LaCie/bold-thumbnails</string>
+		<key>THUMB_TIMING</key>
+		<string>1</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/Volumes/LaCie/bold-thumbnails</key>
+			<true/>
+		</dict>
+	</dict>
+
+	<!-- Restarts are cheap but not free, and once the harvest is complete the
+	     launcher exits immediately; 5 minutes keeps that idle case quiet. -->
+	<key>ThrottleInterval</key>
+	<integer>300</integer>
+
+	<key>StandardOutPath</key>
+	<string>/Users/rpage/Development/bold-image-harvest/launchd-thumbnails.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/rpage/Development/bold-image-harvest/launchd-thumbnails.log</string>
+</dict>
+</plist>
