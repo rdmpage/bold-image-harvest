@@ -769,7 +769,7 @@ function run_thumbnails($limit = 0)
 			// per-row records, upload the whole sub-batch in parallel, then
 			// apply the DB updates in one short transaction.
 			$updates  = array();   // [object_id, sha1, size]
-			$errors   = array();   // [object_id, code]
+			$errors   = array();   // [object_id, message]
 			$prepared = array();   // successful downloads awaiting upload
 			$batch_transient = 0;
 
@@ -849,7 +849,16 @@ function run_thumbnails($limit = 0)
 				}
 				elseif ($body !== null && $code >= 400 && $code < 500 && $code != 429)
 				{
-					$errors[] = array($r->object_id, $code);   // permanent: 404/410/etc
+					$errors[] = array($r->object_id, 'http ' . $code);   // permanent: 404/410/etc
+					$total_err++;
+				}
+				elseif ($code == 200 && $body === '')
+				{
+					// BOLD redirects to presigned object-storage URLs that can
+					// resolve to a zero-byte object: a 200 carrying no bytes.
+					// There is nothing to retry -- park it like a 404, otherwise
+					// it stays in the queue forever and the pass never finishes.
+					$errors[] = array($r->object_id, 'empty object (http 200, 0 bytes)');
 					$total_err++;
 				}
 				else
@@ -935,7 +944,7 @@ function run_thumbnails($limit = 0)
 				}
 				foreach ($errors as $e)
 				{
-					$ok = $mark_err->execute(array('http ' . $e[1], $now, $e[0])) && $ok;
+					$ok = $mark_err->execute(array($e[1], $now, $e[0])) && $ok;
 				}
 				$committed = $ok && $pdo->commit();
 				if (!$committed)
