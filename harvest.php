@@ -737,7 +737,7 @@ function run_thumbnails($limit = 0)
 		// Pull the whole specimen record: it all goes into the _info.json sidecar
 		// so the bucket alone is enough to reconstruct provenance if the DBs die.
 		$rows = db_get('SELECT object_id, image_url, thumbnail_url, file_name, processid,'
-		             . ' sampleid, taxon, bin_uri, copyright_holder, copyright_year,'
+		             . ' sampleid, taxon, bin_uri, meta, copyright_holder, copyright_year,'
 		             . ' copyright_license, copyright_institution, photographer'
 		             . ' FROM boldcaosimage'
 		             . ' WHERE sha1 IS NULL AND fetch_error IS NULL AND thumbnail_url IS NOT NULL'
@@ -796,6 +796,7 @@ function run_thumbnails($limit = 0)
 						'sampleid'      => 'sampleid',
 						'taxon'         => 'taxon',
 						'bin_uri'       => 'bin_uri',
+						'meta'          => 'meta',       // pics rows carry title/view here
 						'copyright_holder'      => 'copyright_holder',
 						'copyright_year'        => 'copyright_year',
 						'copyright_license'     => 'copyright_license',
@@ -809,6 +810,14 @@ function run_thumbnails($limit = 0)
 						{
 							$source[$key] = $r->{$col};
 						}
+					}
+					// meta holds a JSON object (pics rows put title/view there).
+					// Inline it rather than embedding an escaped string, so the
+					// sidecar stays readable; leave it alone if it isn't JSON.
+					if (isset($source['meta']) && is_string($source['meta']))
+					{
+						$decoded = json_decode($source['meta'], true);
+						if (is_array($decoded)) { $source['meta'] = $decoded; }
 					}
 					// sha1/size/mimetype/md5 stay top-level; mimetype is the one
 					// field the content-store resolver actually reads.
